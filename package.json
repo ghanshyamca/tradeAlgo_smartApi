@@ -1,0 +1,14 @@
+{
+  "name": "tradealgo-smartapi-nifty50",
+  "version": "1.0.0",
+  "private": true,
+  "type": "commonjs",
+  "scripts": {
+    "start": "node src/check.js"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "mongodb": "^6.17.0",
+    "smartapi-javascript": "^1.0.27"
+  }
+}
