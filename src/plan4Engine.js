@@ -16,8 +16,9 @@
  *      fetches the option-greek chain, selects the delta>=0.5 strike, logs a
  *      PAPER trade to data/plan4_trades_<date>.csv and posts to Telegram.
  *
- *  ORDER MODE: PAPER (signal + log only). No real orders are placed.
- *  Flip LIVE_TRADING to true only after you have wired real placeOrder calls.
+ *  MODE: ALERT-ONLY. No trades are taken (not even paper). The engine only
+ *  detects the Plan-4 condition and, once CONFIRMED, posts the signal to the
+ *  Telegram channel. All "levels" below are posted as heads-up info, not orders.
  *
  *  PLAN-4 RULES IMPLEMENTED (see mapping in comments below):
  *   cond : NIFTY spot candle closes OUTSIDE the Bollinger Band
@@ -73,7 +74,9 @@ const CONFIG = {
     LOT_AVERAGE_POINTS: 15,                     // g3/h3 premium step
     MAX_LOTS: 3,
 
-    LIVE_TRADING: false,                        // keep FALSE (paper mode)
+    TAKE_TRADES: false,                         // ALERT-ONLY: never place/track a position
+    POST_SETUP_ALERT: false,                    // post the early (pre-wait) setup too? default: only post CONFIRMED
+    LIVE_TRADING: false,                        // kept FALSE; unused while TAKE_TRADES is false
 
     DATA_DIR: path.join(__dirname, '..', 'data'),
 };
@@ -335,13 +338,13 @@ class Plan4Engine {
         };
 
         const msg =
-            `⚠️ <b>Plan-4 SETUP</b> — NIFTY outside BB\n` +
+            `⚠️ <b>Plan-4 SETUP forming</b> — NIFTY outside BB\n` +
             `Candle ${minToHHMM(candle.startMin)}-${minToHHMM(endMin)} closed <b>${pos.toUpperCase()}</b> band (doji/hammer)\n` +
             `Close: ${candle.close.toFixed(2)} | BB ${bands.lower.toFixed(0)}–${bands.upper.toFixed(0)}\n` +
             `Marked prev-high: <b>${previousHigh.toFixed(2)}</b> | trigger open: ${candle.open.toFixed(2)}\n` +
-            `Primary side: <b>${side}</b>. Waiting ${CONFIG.WAIT_AFTER_TRIGGER_MIN}m for entry…`;
+            `Likely side: <b>${side}</b>. Confirming in ${CONFIG.WAIT_AFTER_TRIGGER_MIN}m…`;
         console.log('\n' + msg.replace(/<[^>]+>/g, '') + '\n');
-        sendTelegram(msg);
+        if (CONFIG.POST_SETUP_ALERT) sendTelegram(msg); // otherwise wait for CONFIRMED post
         this.logTrade('SETUP', {
             side, refSpot: candle.close, level: previousHigh,
             note: `${pos} band reversal, open=${candle.open.toFixed(2)}`,
@@ -354,78 +357,84 @@ class Plan4Engine {
         if (mins >= CONFIG.SESSION_END_MIN) return this.endOfDay();
 
         if (this.setup && this.setup.state === 'WAIT' && mins >= this.setup.waitUntilMin) {
-            await this.enterTrade();
+            await this.confirmSignal();
         }
     }
 
-    async enterTrade() {
-        this.setup.state = 'ENTERING';
+    /** c3 wait elapsed -> confirm the signal (d3 strike) and POST to Telegram. No trade. */
+    async confirmSignal() {
+        this.setup.state = 'CONFIRMING';
         try {
             const greeks = await fetchOptionGreeks(this.smartAPI, CONFIG.UNDERLYING, CONFIG.EXPIRY);
             const pick = selectStrike(greeks, this.setup.side, CONFIG.DELTA_THRESHOLD);
             if (!pick) {
-                this.logTrade('ENTRY_SKIP', { side: this.setup.side, note: 'no strike with delta>=0.5' });
-                sendTelegram(`❌ Plan-4: no ${this.setup.side} strike with |delta|>=${CONFIG.DELTA_THRESHOLD}. Skipping.`);
+                this.logTrade('NO_SIGNAL', { side: this.setup.side, note: 'no strike with delta>=0.5' });
+                console.log(`[signal] no ${this.setup.side} strike with |delta|>=${CONFIG.DELTA_THRESHOLD}; nothing posted`);
                 this.setup = null;
                 return;
             }
-            this.setup.state = 'IN_TRADE';
-            const entry = { lot: 1, strike: pick.strikePrice, side: this.setup.side, delta: pick.delta, refSpot: this.lastLTP };
-            this.setup.entries.push(entry);
+            this.setup.state = 'CONFIRMED';
+            this.setup.pick = pick;
 
             const msg =
-                `🟢 <b>Plan-4 ENTRY (paper)</b>\n` +
-                `BUY <b>${pick.strikePrice} ${this.setup.side}</b>  (delta ${pick.delta.toFixed(3)})\n` +
-                `Spot: ${this.lastLTP != null ? this.lastLTP.toFixed(2) : 'n/a'} | IV ${pick.impliedVolatility}%\n` +
-                `Marked high ${this.setup.previousHigh.toFixed(2)} → ` +
-                `SL @ spot ${(this.setup.previousHigh + CONFIG.SL_POINTS).toFixed(2)}, ` +
-                `Target +${CONFIG.TARGET_POINTS}pts`;
+                `✅ <b>Plan-4 SIGNAL CONFIRMED</b> — NIFTY\n` +
+                `Direction: broke <b>${this.setup.direction.toUpperCase()}</b> BB → side <b>${this.setup.side}</b>\n` +
+                `Strike: <b>${pick.strikePrice} ${this.setup.side}</b>  (delta ${pick.delta.toFixed(3)}, IV ${pick.impliedVolatility}%)\n` +
+                `Spot now: ${this.lastLTP != null ? this.lastLTP.toFixed(2) : 'n/a'}\n` +
+                `Marked prev-high: <b>${this.setup.previousHigh.toFixed(2)}</b>\n` +
+                `Watch levels → SL ${ (this.setup.previousHigh + CONFIG.SL_POINTS).toFixed(2) } · ` +
+                `Target ${ (this.setup.previousHigh + CONFIG.TARGET_POINTS).toFixed(2) }\n` +
+                `ℹ️ Alert only — no order placed.`;
             console.log('\n' + msg.replace(/<[^>]+>/g, '') + '\n');
             sendTelegram(msg);
-            this.logTrade('ENTRY', {
+            this.logTrade('SIGNAL', {
                 side: this.setup.side, strike: pick.strikePrice, delta: pick.delta,
-                refSpot: this.lastLTP, level: this.setup.previousHigh, note: 'lot1',
+                refSpot: this.lastLTP, level: this.setup.previousHigh, note: 'confirmed',
             });
+
+            if (!CONFIG.TAKE_TRADES) {
+                // Alert-only: keep watching levels for info alerts, then clear on target/SL.
+                this.setup.state = 'WATCHING';
+            }
         } catch (err) {
-            console.error('[entry] failed:', err.message);
-            this.logTrade('ENTRY_ERROR', { note: err.message });
-            sendTelegram(`❌ Plan-4 entry error: ${err.message}`);
+            console.error('[signal] failed:', err.message);
+            this.logTrade('SIGNAL_ERROR', { note: err.message });
+            sendTelegram(`❌ Plan-4 signal error: ${err.message}`);
             this.setup.state = 'WAIT'; // retry on next tick
         }
     }
 
-    /** Live monitoring for f3 (flip), i3 (SL), j3 (target). Spot-referenced. */
+    /** Post informational level alerts for a CONFIRMED signal. Never trades. */
     monitorTrade(spot) {
         const st = this.setup;
-        if (!st || st.state !== 'IN_TRADE') return;
+        if (!st || st.state !== 'WATCHING') return;
 
-        // i3: STOP-LOSS — spot reaches markedHigh + 15
+        // i3 level (info): spot reaches markedHigh + 15
         const slLevel = st.previousHigh + CONFIG.SL_POINTS;
         if (spot >= slLevel && !st.slDone) {
             st.slDone = true;
-            this.logTrade('STOP_LOSS', { refSpot: spot, level: slLevel, note: 'square-off MKT' });
-            sendTelegram(`🛑 <b>Plan-4 STOP-LOSS</b> — spot ${spot.toFixed(2)} ≥ ${slLevel.toFixed(2)}. Square-off all.`);
-            this.setup = null;
+            this.logTrade('SL_LEVEL', { refSpot: spot, level: slLevel, note: 'info' });
+            sendTelegram(`⚠️ <b>Plan-4</b> SL-watch level reached — spot ${spot.toFixed(2)} ≥ ${slLevel.toFixed(2)}.`);
+            this.setup = null; // close this signal; ready to detect the next
             return;
         }
 
-        // j3: TARGET — spot moves +60 from the marked reference (previousHigh)
+        // j3 level (info): spot reaches markedHigh + 60
         const tgtLevel = st.previousHigh + CONFIG.TARGET_POINTS;
         if (spot >= tgtLevel && !st.tgtDone) {
             st.tgtDone = true;
-            this.logTrade('TARGET', { refSpot: spot, level: tgtLevel, note: 'exit all +60' });
-            sendTelegram(`🎯 <b>Plan-4 TARGET</b> — spot ${spot.toFixed(2)} ≥ ${tgtLevel.toFixed(2)}. Exit all.`);
+            this.logTrade('TARGET_LEVEL', { refSpot: spot, level: tgtLevel, note: 'info' });
+            sendTelegram(`🎯 <b>Plan-4</b> Target-watch level reached — spot ${spot.toFixed(2)} ≥ ${tgtLevel.toFixed(2)}.`);
             this.setup = null;
             return;
         }
 
-        // f3: spot hits the marked previous-high -> flip to opposite side
+        // f3 (info): spot hits the marked previous-high -> reversal side heads-up
         if (!st.flipped && spot >= st.previousHigh) {
             st.flipped = true;
             const opp = st.side === 'CE' ? 'PE' : 'CE';
-            this.logTrade('FLIP', { side: opp, refSpot: spot, level: st.previousHigh, note: `flip ${st.side}->${opp}` });
-            sendTelegram(`🔄 <b>Plan-4 FLIP</b> — spot hit prev-high ${st.previousHigh.toFixed(2)}. Take ${opp} trade.`);
-            // NOTE: opposite-side entry would fetch greeks again in a full build.
+            this.logTrade('FLIP_LEVEL', { side: opp, refSpot: spot, level: st.previousHigh, note: 'info' });
+            sendTelegram(`🔄 <b>Plan-4</b> spot hit prev-high ${st.previousHigh.toFixed(2)} — reversal side would be ${opp}.`);
         }
     }
 
@@ -434,8 +443,8 @@ class Plan4Engine {
         this._ended = true;
         console.log('\n[eod] 15:30 IST — session complete.');
         if (this.current) this.closeCandle(this.current);
-        this.logTrade('EOD', { note: 'session end, flat all' });
-        sendTelegram('🔔 Plan-4: 15:30 IST — session ended, all positions squared off.');
+        this.logTrade('EOD', { note: 'session end' });
+        sendTelegram('🔔 Plan-4: 15:30 IST — session ended. No more alerts today.');
         this.stop();
     }
 
@@ -462,7 +471,7 @@ class Plan4Engine {
 
         await this.connectWS();
         console.log(`[run] streaming — CSV: ${this.candleCsv}`);
-        sendTelegram(`▶️ Plan-4 engine started for ${this.dateStr} (paper mode).`);
+        sendTelegram(`▶️ Plan-4 alert bot started for ${this.dateStr} (alert-only, no trades).`);
 
         // 1-second scheduler drives the WAIT->ENTRY transition and EOD.
         this._timer = setInterval(() => this.tick1s().catch((e) => console.error(e)), 1000);
