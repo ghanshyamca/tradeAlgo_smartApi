@@ -10,10 +10,19 @@
  */
 
 const https = require('https');
+const fs = require('fs');
+const path = require('path');
 require('dotenv').config();
 
 function isConfigured() {
     return Boolean(process.env.TELEGRAM_BOT_TOKEN && process.env.TELEGRAM_CHAT_ID);
+}
+
+function creds() {
+    return {
+        token: process.env.TELEGRAM_BOT_TOKEN.replace(/^"|"$/g, ''),
+        chatId: process.env.TELEGRAM_CHAT_ID.replace(/^"|"$/g, ''),
+    };
 }
 
 function sendTelegram(text) {
@@ -23,8 +32,7 @@ function sendTelegram(text) {
             return resolve({ ok: false, skipped: true });
         }
 
-        const token = process.env.TELEGRAM_BOT_TOKEN.replace(/^"|"$/g, '');
-        const chatId = process.env.TELEGRAM_CHAT_ID.replace(/^"|"$/g, '');
+        const { token, chatId } = creds();
 
         const payload = JSON.stringify({
             chat_id: chatId,
@@ -67,4 +75,76 @@ function sendTelegram(text) {
     });
 }
 
-module.exports = { sendTelegram, isConfigured };
+/**
+ * Upload a file to the channel via sendDocument (multipart/form-data).
+ * Telegram caps bot uploads at 50 MB.
+ */
+function sendTelegramDocument(filePath, caption = '') {
+    return new Promise((resolve) => {
+        if (!isConfigured()) {
+            console.log('[telegram] not configured (skipping upload):', filePath);
+            return resolve({ ok: false, skipped: true });
+        }
+        if (!fs.existsSync(filePath)) {
+            console.error('[telegram] file not found:', filePath);
+            return resolve({ ok: false, error: 'ENOENT' });
+        }
+
+        const { token, chatId } = creds();
+        const file = fs.readFileSync(filePath);
+        const name = path.basename(filePath);
+        const boundary = '----tradeAlgoBoundary' + Buffer.from(name).toString('hex').slice(0, 16);
+        const CRLF = '\r\n';
+
+        const field = (n, v) =>
+            Buffer.from(`--${boundary}${CRLF}Content-Disposition: form-data; name="${n}"${CRLF}${CRLF}${v}${CRLF}`);
+
+        const body = Buffer.concat([
+            field('chat_id', chatId),
+            field('caption', caption),
+            field('parse_mode', 'HTML'),
+            Buffer.from(
+                `--${boundary}${CRLF}` +
+                `Content-Disposition: form-data; name="document"; filename="${name}"${CRLF}` +
+                `Content-Type: text/csv${CRLF}${CRLF}`
+            ),
+            file,
+            Buffer.from(`${CRLF}--${boundary}--${CRLF}`),
+        ]);
+
+        const req = https.request(
+            {
+                hostname: 'api.telegram.org',
+                path: `/bot${token}/sendDocument`,
+                method: 'POST',
+                headers: {
+                    'Content-Type': `multipart/form-data; boundary=${boundary}`,
+                    'Content-Length': body.length,
+                },
+            },
+            (res) => {
+                let out = '';
+                res.on('data', (c) => (out += c));
+                res.on('end', () => {
+                    if (res.statusCode === 200) {
+                        console.log(`[telegram] uploaded ${name} (${(file.length / 1024).toFixed(1)} KB)`);
+                        resolve({ ok: true });
+                    } else {
+                        console.error('[telegram] upload failed:', res.statusCode, out);
+                        resolve({ ok: false, status: res.statusCode, body: out });
+                    }
+                });
+            }
+        );
+
+        req.on('error', (err) => {
+            console.error('[telegram] request error:', err.message);
+            resolve({ ok: false, error: err.message });
+        });
+
+        req.write(body);
+        req.end();
+    });
+}
+
+module.exports = { sendTelegram, sendTelegramDocument, isConfigured };
