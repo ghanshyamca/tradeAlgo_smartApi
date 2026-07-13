@@ -19,6 +19,7 @@
 
 const fs = require('fs');
 const path = require('path');
+const { spawn } = require('child_process');
 require('dotenv').config();
 
 const { sendTelegram, sendTelegramDocument, isConfigured } = require('./lib/telegram');
@@ -71,6 +72,28 @@ function waitUntilPushTime() {
     });
 }
 
+/**
+ * One-shot mode: remove this job from pm2 entirely once it has pushed.
+ * Off by default — the ecosystem file runs the push daily on a cron, and a
+ * deleted app has no entry left for that cron to fire. Opt in with
+ * PM2_DELETE_ON_DONE=true when you want a fire-once job that disappears.
+ *
+ * `pm2 delete` kills us mid-call, so the child has to be detached to survive it.
+ */
+function pm2SelfDelete() {
+    if (process.env.PM2_DELETE_ON_DONE !== 'true') return false;
+
+    const id = process.env.name || process.env.pm_id;
+    if (id === undefined || id === '') return false;
+
+    spawn('pm2', ['delete', String(id)], {
+        detached: true,
+        stdio: 'ignore',
+        shell: true, // Windows needs the shell to resolve pm2.cmd
+    }).unref();
+    return true;
+}
+
 function rowCount(file) {
     const lines = fs.readFileSync(file, 'utf8').split('\n').filter(Boolean);
     return Math.max(0, lines.length - 1); // minus header
@@ -117,10 +140,15 @@ async function main() {
     }
 
     if (failed) {
+        // Leave the job in pm2 so a restart can retry the upload.
         console.error(`[push] ${failed} of ${present.length} upload(s) failed.`);
         process.exit(1);
     }
     console.log(`[push] done — ${present.length} file(s) sent to the channel.`);
+
+    if (pm2SelfDelete()) {
+        console.log('[push] removed this job from pm2 — no restart.');
+    }
 }
 
 main().catch((err) => {

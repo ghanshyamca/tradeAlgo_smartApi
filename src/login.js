@@ -1,10 +1,13 @@
 /**
- * SmartAPI Authentication Script
- * Generates new access and refresh tokens
- * Run this first before using other scripts
+ * SmartAPI Authentication
+ * Generates new access / refresh / feed tokens and writes them back to .env.
  *
- * Usage: node src/login.js <totp>
- * Example: node src/login.js 123456
+ * The TOTP is generated from SMARTAPI_TOTP_SECRET (the base32 secret behind the
+ * QR code on Angel One's "Enable TOTP" page), so this runs unattended — pm2 can
+ * call it at market start. Pass a code by hand to override:
+ *
+ *   node src/login.js            # auto TOTP from SMARTAPI_TOTP_SECRET
+ *   node src/login.js 123456     # use this code instead
  */
 
 const { SmartAPI } = require('smartapi-javascript');
@@ -12,101 +15,95 @@ const fs = require('fs');
 const path = require('path');
 require('dotenv').config();
 
-async function login(totp) {
-    console.log('=== SmartAPI Login ===\n');
+const { generateTotp, secondsUntilRotation } = require('./lib/totp');
 
+const ENV_PATH = path.join(__dirname, '..', '.env');
+
+/** Upsert KEY="value" in .env, and in this process's env so callers see it too. */
+function writeEnvTokens(tokens) {
+    let content = fs.existsSync(ENV_PATH) ? fs.readFileSync(ENV_PATH, 'utf8') : '';
+
+    for (const [key, value] of Object.entries(tokens)) {
+        if (!value) continue;
+        const line = `${key}="${value}"`;
+        const re = new RegExp(`^${key}=.*$`, 'm');
+        content = re.test(content) ? content.replace(re, line) : `${content.replace(/\s*$/, '')}\n${line}\n`;
+        process.env[key] = value;
+    }
+
+    fs.writeFileSync(ENV_PATH, content, 'utf8');
+}
+
+/** The code rotates every 30s; a code with <5s left can expire in flight at Angel's end. */
+function freshTotp(secret) {
+    if (secondsUntilRotation() >= 5) return Promise.resolve(generateTotp(secret));
+
+    console.log('[login] TOTP about to rotate — waiting for the next window…');
+    return new Promise((resolve) => {
+        setTimeout(() => resolve(generateTotp(secret)), secondsUntilRotation() * 1000 + 500);
+    });
+}
+
+/**
+ * Log in and persist the tokens.
+ * @param {string} [totp] explicit 6-digit code; omit to derive it from SMARTAPI_TOTP_SECRET
+ */
+async function login(totp) {
     const apiKey = process.env.SMARTAPI_API_KEY;
     const clientCode = process.env.SMARTAPI_CLIENT_CODE;
     const password = process.env.SMARTAPI_PASSWORD;
+    const secret = process.env.SMARTAPI_TOTP_SECRET;
 
     if (!apiKey || !clientCode || !password) {
-        console.error('Missing credentials in .env file');
-        console.log('Required: SMARTAPI_API_KEY, SMARTAPI_CLIENT_CODE, SMARTAPI_PASSWORD');
-        console.log('\nUsage: node src/login.js <totp>');
-        console.log('Example: node src/login.js 123456');
-        process.exit(1);
+        throw new Error('Missing SMARTAPI_API_KEY / SMARTAPI_CLIENT_CODE / SMARTAPI_PASSWORD in .env');
     }
 
     if (!totp) {
-        console.error('TOTP is required');
-        console.log('\nUsage: node src/login.js <totp>');
-        console.log('Example: node src/login.js 123456');
-        process.exit(1);
+        if (!secret) {
+            throw new Error(
+                'No TOTP available. Add SMARTAPI_TOTP_SECRET=<base32 secret> to .env ' +
+                '(Angel One → Enable TOTP → the key behind the QR code), or pass a code: node src/login.js 123456'
+            );
+        }
+        totp = await freshTotp(secret);
+        console.log(`[login] TOTP generated automatically (valid ${secondsUntilRotation()}s)`);
     }
 
-    console.log(`Logging in with client code: ${clientCode}`);
+    console.log(`[login] client ${clientCode} — requesting session…`);
 
-    const smartAPI = new SmartAPI({
-        api_key: apiKey
+    const smartAPI = new SmartAPI({ api_key: apiKey });
+    const session = await smartAPI.generateSession(clientCode, password, totp);
+
+    const data = session && session.data;
+    if (!data || !data.jwtToken) {
+        // Angel returns 200 with { status: false, message } on a bad TOTP/password.
+        const why = (session && (session.message || session.errorcode)) || 'no jwtToken in response';
+        throw new Error(`Login failed: ${why}`);
+    }
+
+    writeEnvTokens({
+        SMARTAPI_ACCESS_TOKEN: data.jwtToken,
+        SMARTAPI_REFRESH_TOKEN: data.refreshToken,
+        SMARTAPI_FEED_TOKEN: data.feedToken,
     });
+    console.log('[login] ok — tokens written to .env');
 
-    try {
-        // Generate session with credentials
-        const session = await smartAPI.generateSession(clientCode, password, totp);
-
-        console.log('\nLogin successful!');
-
-        console.log('Session response:', JSON.stringify(session, null, 2));
-
-        if (session && session.data) {
-            const jwtToken = session.data.jwtToken;
-            const refreshToken = session.data.refreshToken;
-            const feedToken = session.data.feedToken;
-
-            console.log('\n=== New Tokens Generated ===');
-            console.log('\nUpdate your .env file with these values:\n');
-
-            console.log(`SMARTAPI_ACCESS_TOKEN="${jwtToken}"`);
-            console.log(`SMARTAPI_REFRESH_TOKEN="${refreshToken}"`);
-            console.log(`SMARTAPI_FEED_TOKEN="${feedToken}"`);
-
-            // Also update the .env file directly
-            const envPath = path.join(__dirname, '..', '.env');
-            let envContent = fs.readFileSync(envPath, 'utf8');
-
-            // Update access token
-            envContent = envContent.replace(
-                /SMARTAPI_ACCESS_TOKEN=.*/,
-                `SMARTAPI_ACCESS_TOKEN="${jwtToken}"`
-            );
-
-            // Update refresh token
-            envContent = envContent.replace(
-                /SMARTAPI_REFRESH_TOKEN=.*/,
-                `SMARTAPI_REFRESH_TOKEN="${refreshToken}"`
-            );
-
-            // Update feed token
-            envContent = envContent.replace(
-                /SMARTAPI_FEED_TOKEN=.*/,
-                `SMARTAPI_FEED_TOKEN="${feedToken}"`
-            );
-
-            fs.writeFileSync(envPath, envContent, 'utf8');
-
-            console.log('\n✓ .env file updated with new tokens!');
-        }
-
-        return session;
-
-    } catch (error) {
-        console.error('\nLogin failed:', error.message);
-        if (error.response) {
-            console.error('Error details:', JSON.stringify(error.response.data));
-        }
-        process.exit(1);
-    }
+    return {
+        smartAPI,
+        jwtToken: data.jwtToken,
+        refreshToken: data.refreshToken,
+        feedToken: data.feedToken,
+    };
 }
 
 if (require.main === module) {
-    const totp = process.argv[2];
-    login(totp).then(() => {
-        console.log('\nYou can now run the data fetcher script.');
-        process.exit(0);
-    }).catch(error => {
-        console.error('Fatal error:', error);
-        process.exit(1);
-    });
+    login(process.argv[2])
+        .then(() => process.exit(0))
+        .catch((err) => {
+            console.error('[login] fatal:', err.message);
+            if (err.response) console.error('details:', JSON.stringify(err.response.data));
+            process.exit(1);
+        });
 }
 
 module.exports = { login };

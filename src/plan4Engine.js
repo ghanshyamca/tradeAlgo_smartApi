@@ -586,18 +586,22 @@ class Plan4Engine {
     }
 
     async run() {
-        await this.init();
-
-        // Idle-wait until 09:15 if started early.
+        // Idle-wait until the open if started early.
         let mins = istMinutesOfDay();
         if (mins >= CONFIG.SESSION_END_MIN) {
             console.log('[run] market already closed for today. Exiting.');
             return this.stop();
         }
+        const startHHMM = `${String(Math.floor(CONFIG.SESSION_START_MIN / 60)).padStart(2, '0')}:` +
+            `${String(CONFIG.SESSION_START_MIN % 60).padStart(2, '0')}`;
         while (istMinutesOfDay() < CONFIG.SESSION_START_MIN) {
-            console.log(`[run] waiting for 09:15 IST (now ${istTimeStr()})…`);
+            console.log(`[run] waiting for ${startHHMM} IST (now ${istTimeStr()})…`);
             await new Promise((r) => setTimeout(r, 15000));
         }
+
+        // Log in at the open, not at boot: tokens minted overnight are already
+        // dead by the time the session starts, and the TOTP is generated for us.
+        await this.init();
 
         await this.connectWS();
         console.log(`[run] streaming — CSV: ${this.candleCsv}`);
