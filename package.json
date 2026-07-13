@@ -5,7 +5,8 @@
   "type": "commonjs",
   "scripts": {
     "start": "node src/check.js",
-    "plan4": "node src/plan4Engine.js"
+    "plan4": "node src/plan4Engine.js",
+    "plan4:silver": "node src/recordSilver.js"
   },
   "dependencies": {
     "dotenv": "^16.4.5",

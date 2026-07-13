@@ -44,21 +44,54 @@ const { fetchOptionGreeks, selectStrike } = require('./lib/greeks');
 const { sendTelegram } = require('./lib/telegram');
 
 // ----------------------------------------------------------------------------
+// INSTRUMENT PRESETS  —  select with  MARKET=NIFTY | SILVER   (default NIFTY)
+// ----------------------------------------------------------------------------
+function hhmmToMin(s, def) {
+    const m = s && /^(\d{1,2}):(\d{2})$/.exec(String(s).trim());
+    return m ? (+m[1]) * 60 + (+m[2]) : def;
+}
+
+const PRESETS = {
+    NIFTY: {
+        SYMBOL: 'NIFTY 50', TOKEN: '99926000', EXCHANGE: 'NSE', WS_EXCHANGE_TYPE: 1,
+        UNDERLYING: 'NIFTY', EXPIRY: process.env.NIFTY_EXPIRY || '07JUL2026',
+        START: '09:15', END: '15:30', USE_GREEKS: true,
+    },
+    // MCX silver front-month future (open ~09:00–23:30 IST). Futures test:
+    // record candles + detect BB signal, but no option-greek strike selection.
+    SILVER: {
+        SYMBOL: process.env.SILVER_SYMBOL || 'SILVER04SEP26FUT',
+        TOKEN: process.env.SILVER_TOKEN || '471725',
+        EXCHANGE: 'MCX', WS_EXCHANGE_TYPE: 5,
+        UNDERLYING: 'SILVER', EXPIRY: process.env.SILVER_EXPIRY || '',
+        START: '09:00', END: '23:30', USE_GREEKS: false,
+    },
+};
+
+const P = PRESETS[(process.env.MARKET || 'NIFTY').toUpperCase()] || PRESETS.NIFTY;
+
+// ----------------------------------------------------------------------------
 // CONFIG  (tune the ambiguous Plan-4 numbers here)
 // ----------------------------------------------------------------------------
 const CONFIG = {
-    SYMBOL: 'NIFTY 50',
-    TOKEN: '99926000',
-    EXCHANGE: 'NSE',
-    UNDERLYING: 'NIFTY',                        // for optionGreek
-    EXPIRY: process.env.NIFTY_EXPIRY || '07JUL2026', // set current weekly expiry
+    MARKET: (process.env.MARKET || 'NIFTY').toUpperCase(),
+    SYMBOL: P.SYMBOL,
+    TOKEN: P.TOKEN,
+    EXCHANGE: P.EXCHANGE,
+    WS_EXCHANGE_TYPE: P.WS_EXCHANGE_TYPE,
+    UNDERLYING: P.UNDERLYING,                    // for optionGreek
+    EXPIRY: P.EXPIRY,
+    USE_GREEKS: P.USE_GREEKS,
 
     BB_PERIOD: 20,
     BB_MULT: 2,
-    CANDLE_MINUTES: 30,
+    CANDLE_MINUTES: Number(process.env.CANDLE_MINUTES) || 30, // env override for quick tests
 
-    SESSION_START_MIN: 9 * 60 + 15,             // 09:15 IST
-    SESSION_END_MIN: 15 * 60 + 30,              // 15:30 IST
+    SESSION_START_MIN: hhmmToMin(process.env.SESSION_START, hhmmToMin(P.START)),
+    SESSION_END_MIN: hhmmToMin(process.env.SESSION_END, hhmmToMin(P.END)),
+
+    WS_MODE: Number(process.env.WS_MODE) || 2,  // 1=LTP, 2=Quote (LTP+OHLC+vol), 3=SnapQuote
+    RECORD_TICKS: process.env.RECORD_TICKS !== 'false', // log every raw WS tick to a CSV
 
     WAIT_AFTER_TRIGGER_MIN: 25,                 // c3
     DELTA_THRESHOLD: 0.5,                       // d3
@@ -137,24 +170,114 @@ class Plan4Engine {
         this.dateStr = istDateStr();
 
         if (!fs.existsSync(CONFIG.DATA_DIR)) fs.mkdirSync(CONFIG.DATA_DIR, { recursive: true });
-        this.candleCsv = path.join(CONFIG.DATA_DIR, `nifty50_30min_${this.dateStr}.csv`);
-        this.tradeCsv = path.join(CONFIG.DATA_DIR, `plan4_trades_${this.dateStr}.csv`);
+        const mkt = CONFIG.MARKET.toLowerCase();
+        this.candleCsv = path.join(CONFIG.DATA_DIR, `${mkt}_${CONFIG.CANDLE_MINUTES}min_${this.dateStr}.csv`);
+        this.tradeCsv = path.join(CONFIG.DATA_DIR, `plan4_${mkt}_signals_${this.dateStr}.csv`);
+        this.tickCsv = path.join(CONFIG.DATA_DIR, `${mkt}_ticks_${this.dateStr}.csv`);
+        this.tickBuffer = [];       // raw ticks buffered, flushed to CSV every second
         this._initCsv();
     }
 
     _initCsv() {
-        if (!fs.existsSync(this.candleCsv)) {
-            fs.writeFileSync(
-                this.candleCsv,
-                'Date,CandleStart,CandleEnd,Open,High,Low,Close,BB_Mid,BB_Upper,BB_Lower,Position,Reversal\n'
-            );
+        this.candleHeader =
+            'Date,CandleStart,CandleEnd,Open,High,Low,Close,BB_Mid,BB_Upper,BB_Lower,Position,Reversal,Status';
+        this.liveRow = null; // current forming candle row (rewritten frequently)
+
+        // committed = header + all FINAL rows (survives restart on the same day)
+        if (fs.existsSync(this.candleCsv)) {
+            const lines = fs.readFileSync(this.candleCsv, 'utf8').split('\n').filter(Boolean);
+            const finals = lines.slice(1).filter((l) => l.endsWith(',FINAL'));
+            this.committed = [this.candleHeader, ...finals];
+        } else {
+            this.committed = [this.candleHeader];
         }
+        this._writeCandleFile();
+
         if (!fs.existsSync(this.tradeCsv)) {
+            fs.writeFileSync(this.tradeCsv, 'Time,Event,Side,Strike,Delta,RefSpot,Level,Note\n');
+        }
+
+        // Raw tick CSV — every WebSocket tick, full quote fields (append-only).
+        if (CONFIG.RECORD_TICKS && !fs.existsSync(this.tickCsv)) {
             fs.writeFileSync(
-                this.tradeCsv,
-                'Time,Event,Side,Strike,Delta,RefSpot,Level,Note\n'
+                this.tickCsv,
+                'RecvTimeIST,ExchTimeIST,Token,LTP,LTQ,AvgPrice,Volume,TotalBuyQty,TotalSellQty,DayOpen,DayHigh,DayLow,PrevClose,SeqNo,Mode\n'
             );
         }
+    }
+
+    /** Buffer one raw WS tick; flushed to CSV by flushTicks(). */
+    recordTick(d) {
+        if (!CONFIG.RECORD_TICKS) return;
+        const px = (v) => (v == null ? '' : (Number(v) / 100).toFixed(2)); // paise -> rupees
+        const exch = d.exchange_timestamp ? new Date(Number(d.exchange_timestamp) + 5.5 * 3600 * 1000) : null;
+        const exchStr = exch
+            ? `${String(exch.getUTCHours()).padStart(2, '0')}:${String(exch.getUTCMinutes()).padStart(2, '0')}:${String(exch.getUTCSeconds()).padStart(2, '0')}`
+            : '';
+        this.tickBuffer.push([
+            istTimeStr(),
+            exchStr,
+            d.token ? String(d.token).replace(/"/g, '') : '',
+            px(d.last_traded_price),
+            d.last_traded_quantity != null ? d.last_traded_quantity : '',
+            px(d.avg_traded_price),
+            d.vol_traded != null ? d.vol_traded : '',
+            d.total_buy_quantity != null ? d.total_buy_quantity : '',
+            d.total_sell_quantity != null ? d.total_sell_quantity : '',
+            px(d.open_price_day),
+            px(d.high_price_day),
+            px(d.low_price_day),
+            px(d.close_price),
+            d.sequence_number != null ? d.sequence_number : '',
+            d.subscription_mode != null ? d.subscription_mode : CONFIG.WS_MODE,
+        ].join(','));
+    }
+
+    /** Write buffered ticks to the tick CSV (called every second). */
+    flushTicks() {
+        if (!this.tickBuffer.length) return;
+        const chunk = this.tickBuffer.join('\n') + '\n';
+        this.tickBuffer = [];
+        fs.appendFileSync(this.tickCsv, chunk);
+    }
+
+    /** Build one CSV row for a candle. status = 'FINAL' | 'LIVE'. */
+    _candleRow(c, bands, pos, rev, endMin, status) {
+        return [
+            this.dateStr,
+            minToHHMM(c.startMin),
+            minToHHMM(endMin),
+            c.open.toFixed(2),
+            c.high.toFixed(2),
+            c.low.toFixed(2),
+            c.close.toFixed(2),
+            bands ? bands.mid.toFixed(2) : '',
+            bands ? bands.upper.toFixed(2) : '',
+            bands ? bands.lower.toFixed(2) : '',
+            pos,
+            rev ? 'YES' : 'NO',
+            status,
+        ].join(',');
+    }
+
+    /** Rewrite the whole candle CSV: committed FINAL rows + the live forming row. */
+    _writeCandleFile() {
+        const body = this.committed.join('\n');
+        const live = this.liveRow ? '\n' + this.liveRow : '';
+        fs.writeFileSync(this.candleCsv, body + live + '\n');
+    }
+
+    /** Append/refresh the current forming candle as a LIVE row so the CSV is never empty. */
+    flushLive() {
+        if (!this.current) return;
+        const c = this.current;
+        const closes = this.candles.map((x) => x.close).concat(c.close);
+        const bands = bollingerBands(closes, CONFIG.BB_PERIOD, CONFIG.BB_MULT);
+        const pos = bandPosition(c, bands);
+        const rev = isReversalCandle(c);
+        const endMin = Math.min(c.startMin + CONFIG.CANDLE_MINUTES, CONFIG.SESSION_END_MIN);
+        this.liveRow = this._candleRow(c, bands, pos, rev, endMin, 'LIVE');
+        this._writeCandleFile();
     }
 
     logTrade(event, obj = {}) {
@@ -229,12 +352,12 @@ class Plan4Engine {
             });
 
             this.ws.connect().then(() => {
-                console.log('[ws] connected, subscribing NIFTY 50');
+                console.log(`[ws] connected, subscribing ${CONFIG.SYMBOL} (${CONFIG.EXCHANGE})`);
                 this.ws.fetchData({
                     correlationID: 'plan4',
-                    action: 1,          // subscribe
-                    mode: 1,            // LTP
-                    exchangeType: 1,    // NSE
+                    action: 1,                              // subscribe
+                    mode: CONFIG.WS_MODE,                   // 1=LTP, 2=Quote, 3=SnapQuote
+                    exchangeType: CONFIG.WS_EXCHANGE_TYPE,  // 1=NSE_CM, 5=MCX_FO
                     tokens: [CONFIG.TOKEN],
                 });
                 resolve();
@@ -249,10 +372,11 @@ class Plan4Engine {
         if (!data) return;
         let token = data.token ? String(data.token).replace(/"/g, '') : null;
         if (token !== CONFIG.TOKEN) return;
+        this.recordTick(data);                  // log EVERY raw tick (full quote fields)
         const ltp = parseFloat(data.last_traded_price) / 100;
         if (!ltp || Number.isNaN(ltp)) return;
         this.lastLTP = ltp;
-        this.updateCandle(ltp);
+        this.updateCandle(ltp);                 // algo: 30-min candle aggregation only
         if (this.setup) this.monitorTrade(ltp); // f3 / i3 / j3 live checks
     }
 
@@ -284,23 +408,9 @@ class Plan4Engine {
         this.candles.push({ ...c, time: `${this.dateStr} ${minToHHMM(c.startMin)}` });
 
         const endMin = Math.min(c.startMin + CONFIG.CANDLE_MINUTES, CONFIG.SESSION_END_MIN);
-        fs.appendFileSync(
-            this.candleCsv,
-            [
-                this.dateStr,
-                minToHHMM(c.startMin),
-                minToHHMM(endMin),
-                c.open.toFixed(2),
-                c.high.toFixed(2),
-                c.low.toFixed(2),
-                c.close.toFixed(2),
-                bands ? bands.mid.toFixed(2) : '',
-                bands ? bands.upper.toFixed(2) : '',
-                bands ? bands.lower.toFixed(2) : '',
-                pos,
-                rev ? 'YES' : 'NO',
-            ].join(',') + '\n'
-        );
+        this.committed.push(this._candleRow(c, bands, pos, rev, endMin, 'FINAL'));
+        this.liveRow = null;          // the forming candle is now finalized
+        this._writeCandleFile();
         console.log(
             `[candle] ${minToHHMM(c.startMin)}-${minToHHMM(endMin)} ` +
             `O${c.open.toFixed(1)} H${c.high.toFixed(1)} L${c.low.toFixed(1)} C${c.close.toFixed(1)} ` +
@@ -338,7 +448,7 @@ class Plan4Engine {
         };
 
         const msg =
-            `⚠️ <b>Plan-4 SETUP forming</b> — NIFTY outside BB\n` +
+            `⚠️ <b>Plan-4 SETUP forming</b> — ${CONFIG.UNDERLYING} outside BB\n` +
             `Candle ${minToHHMM(candle.startMin)}-${minToHHMM(endMin)} closed <b>${pos.toUpperCase()}</b> band (doji/hammer)\n` +
             `Close: ${candle.close.toFixed(2)} | BB ${bands.lower.toFixed(0)}–${bands.upper.toFixed(0)}\n` +
             `Marked prev-high: <b>${previousHigh.toFixed(2)}</b> | trigger open: ${candle.open.toFixed(2)}\n` +
@@ -353,6 +463,7 @@ class Plan4Engine {
 
     /** Called on a timer to progress WAIT -> ENTRY once c3 (25 min) elapses. */
     async tick1s() {
+        this.flushTicks();                       // persist raw ticks every second
         const mins = istMinutesOfDay();
         if (mins >= CONFIG.SESSION_END_MIN) return this.endOfDay();
 
@@ -365,21 +476,28 @@ class Plan4Engine {
     async confirmSignal() {
         this.setup.state = 'CONFIRMING';
         try {
-            const greeks = await fetchOptionGreeks(this.smartAPI, CONFIG.UNDERLYING, CONFIG.EXPIRY);
-            const pick = selectStrike(greeks, this.setup.side, CONFIG.DELTA_THRESHOLD);
-            if (!pick) {
-                this.logTrade('NO_SIGNAL', { side: this.setup.side, note: 'no strike with delta>=0.5' });
-                console.log(`[signal] no ${this.setup.side} strike with |delta|>=${CONFIG.DELTA_THRESHOLD}; nothing posted`);
-                this.setup = null;
-                return;
+            let pick = null;
+            if (CONFIG.USE_GREEKS) {
+                const greeks = await fetchOptionGreeks(this.smartAPI, CONFIG.UNDERLYING, CONFIG.EXPIRY);
+                pick = selectStrike(greeks, this.setup.side, CONFIG.DELTA_THRESHOLD);
+                if (!pick) {
+                    this.logTrade('NO_SIGNAL', { side: this.setup.side, note: 'no strike with delta>=0.5' });
+                    console.log(`[signal] no ${this.setup.side} strike with |delta|>=${CONFIG.DELTA_THRESHOLD}; nothing posted`);
+                    this.setup = null;
+                    return;
+                }
             }
             this.setup.state = 'CONFIRMED';
             this.setup.pick = pick;
 
+            const strikeLine = pick
+                ? `Strike: <b>${pick.strikePrice} ${this.setup.side}</b>  (delta ${pick.delta.toFixed(3)}, IV ${pick.impliedVolatility}%)\n`
+                : `Instrument: <b>${CONFIG.SYMBOL}</b>  (side ${this.setup.side}, futures — no greeks)\n`;
+
             const msg =
-                `✅ <b>Plan-4 SIGNAL CONFIRMED</b> — NIFTY\n` +
+                `✅ <b>Plan-4 SIGNAL CONFIRMED</b> — ${CONFIG.UNDERLYING}\n` +
                 `Direction: broke <b>${this.setup.direction.toUpperCase()}</b> BB → side <b>${this.setup.side}</b>\n` +
-                `Strike: <b>${pick.strikePrice} ${this.setup.side}</b>  (delta ${pick.delta.toFixed(3)}, IV ${pick.impliedVolatility}%)\n` +
+                strikeLine +
                 `Spot now: ${this.lastLTP != null ? this.lastLTP.toFixed(2) : 'n/a'}\n` +
                 `Marked prev-high: <b>${this.setup.previousHigh.toFixed(2)}</b>\n` +
                 `Watch levels → SL ${ (this.setup.previousHigh + CONFIG.SL_POINTS).toFixed(2) } · ` +
@@ -388,7 +506,8 @@ class Plan4Engine {
             console.log('\n' + msg.replace(/<[^>]+>/g, '') + '\n');
             sendTelegram(msg);
             this.logTrade('SIGNAL', {
-                side: this.setup.side, strike: pick.strikePrice, delta: pick.delta,
+                side: this.setup.side, strike: pick ? pick.strikePrice : CONFIG.SYMBOL,
+                delta: pick ? pick.delta : '',
                 refSpot: this.lastLTP, level: this.setup.previousHigh, note: 'confirmed',
             });
 
@@ -449,6 +568,9 @@ class Plan4Engine {
     }
 
     stop() {
+        if (this._timer) clearInterval(this._timer);
+        if (this._liveTimer) clearInterval(this._liveTimer);
+        this.flushTicks();                       // persist any remaining buffered ticks
         try {
             if (this.ws && this.ws.close) this.ws.close();
         } catch (_) { /* ignore */ }
@@ -471,10 +593,26 @@ class Plan4Engine {
 
         await this.connectWS();
         console.log(`[run] streaming — CSV: ${this.candleCsv}`);
-        sendTelegram(`▶️ Plan-4 alert bot started for ${this.dateStr} (alert-only, no trades).`);
+        sendTelegram(`▶️ Plan-4 alert bot started — <b>${CONFIG.SYMBOL}</b> (${CONFIG.EXCHANGE}) for ${this.dateStr} (alert-only, no trades).`);
 
         // 1-second scheduler drives the WAIT->ENTRY transition and EOD.
         this._timer = setInterval(() => this.tick1s().catch((e) => console.error(e)), 1000);
+
+        // Refresh the live (forming) candle row in the CSV every few seconds and
+        // print a heartbeat so you can see data flowing before a candle closes.
+        this._liveTimer = setInterval(() => {
+            this.flushLive();
+            if (this.current) {
+                console.log(
+                    `[live] ${istTimeStr()} ${CONFIG.SYMBOL} ` +
+                    `bucket ${minToHHMM(this.current.startMin)} ` +
+                    `O${this.current.open.toFixed(1)} H${this.current.high.toFixed(1)} ` +
+                    `L${this.current.low.toFixed(1)} C${this.current.close.toFixed(1)}`
+                );
+            } else if (this.lastLTP != null) {
+                console.log(`[live] ${istTimeStr()} ${CONFIG.SYMBOL} LTP ${this.lastLTP.toFixed(2)} (waiting for candle bucket)`);
+            }
+        }, (Number(process.env.LIVE_FLUSH_SECONDS) || 10) * 1000);
     }
 }
 
