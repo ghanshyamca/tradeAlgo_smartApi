@@ -42,6 +42,12 @@ const { createSession } = require('./lib/session');
 const { bollingerBands, bandPosition, isReversalCandle } = require('./lib/indicators');
 const { fetchOptionGreeks, selectStrike } = require('./lib/greeks');
 const { fetchMcxGreeks } = require('./lib/mcxGreeks');
+const scrip = require('./lib/scripMaster');
+
+// Confirmation is one API call away from failing (chain not up yet, thin MCX
+// book, token hiccup). Retry a few times, spaced out, then drop the setup.
+const CONFIRM_MAX_ATTEMPTS = 3;
+const CONFIRM_BACKOFF_MS = [15_000, 60_000];   // after attempt 1, after attempt 2
 const { sendTelegram } = require('./lib/telegram');
 
 // ----------------------------------------------------------------------------
@@ -55,7 +61,9 @@ function hhmmToMin(s, def) {
 const PRESETS = {
     NIFTY: {
         SYMBOL: 'NIFTY 50', TOKEN: '99926000', EXCHANGE: 'NSE', WS_EXCHANGE_TYPE: 1,
-        UNDERLYING: 'NIFTY', EXPIRY: process.env.NIFTY_EXPIRY || '07JUL2026',
+        // No default: a hardcoded expiry silently goes stale every week. Left
+        // empty, the engine resolves the nearest live weekly from master.json.
+        UNDERLYING: 'NIFTY', EXPIRY: process.env.NIFTY_EXPIRY || '',
         START: '09:15', END: '15:30', USE_GREEKS: true,
     },
     // MCX silver front-month future (open ~09:00–23:30 IST). Futures test:
@@ -104,6 +112,7 @@ const CONFIG = {
     RECORD_TICKS: process.env.RECORD_TICKS !== 'false', // log every raw WS tick to a CSV
 
     WAIT_AFTER_TRIGGER_MIN: 25,                 // c3
+
     DELTA_THRESHOLD: 0.5,                       // d3
 
     // Mean-reversion side selection:
@@ -471,13 +480,28 @@ class Plan4Engine {
         });
     }
 
+    /** Nearest live option expiry. Resolved once per run — the engine restarts daily. */
+    optionExpiry() {
+        if (CONFIG.EXPIRY) return CONFIG.EXPIRY;   // explicit override from .env
+        if (!this._expiry) {
+            this._expiry = scrip.nearestExpiry('NFO', CONFIG.UNDERLYING, 'OPTIDX');
+            console.log(`[signal] resolved ${CONFIG.UNDERLYING} expiry -> ${this._expiry}`);
+        }
+        return this._expiry;
+    }
+
     /** Called on a timer to progress WAIT -> ENTRY once c3 (25 min) elapses. */
     async tick1s() {
         this.flushTicks();                       // persist raw ticks every second
         const mins = istMinutesOfDay();
         if (mins >= CONFIG.SESSION_END_MIN) return this.endOfDay();
 
-        if (this.setup && this.setup.state === 'WAIT' && mins >= this.setup.waitUntilMin) {
+        if (!this.setup) return;
+
+        if (this.setup.state === 'WAIT' && mins >= this.setup.waitUntilMin) {
+            await this.confirmSignal();
+        } else if (this.setup.state === 'RETRY' && Date.now() >= this.setup.retryAtMs) {
+            // a failed confirmation backs off instead of re-firing every second
             await this.confirmSignal();
         }
     }
@@ -491,7 +515,7 @@ class Plan4Engine {
             //   MCX  -> chain from master.json, priced locally with Black-76
             let greeks = null;
             if (CONFIG.USE_GREEKS) {
-                greeks = await fetchOptionGreeks(this.smartAPI, CONFIG.UNDERLYING, CONFIG.EXPIRY);
+                greeks = await fetchOptionGreeks(this.smartAPI, CONFIG.UNDERLYING, this.optionExpiry());
             } else if (CONFIG.MCX_OPTIONS) {
                 greeks = await fetchMcxGreeks(this.smartAPI, CONFIG.UNDERLYING, this.lastLTP, this.setup.side);
             }
@@ -538,10 +562,29 @@ class Plan4Engine {
                 this.setup.state = 'WATCHING';
             }
         } catch (err) {
-            console.error('[signal] failed:', err.message);
-            this.logTrade('SIGNAL_ERROR', { note: err.message });
-            sendTelegram(`❌ Plan-4 signal error: ${err.message}`);
-            this.setup.state = 'WAIT'; // retry on next tick
+            // A failure here used to reset the state to WAIT, which tick1s re-fired
+            // every second for the rest of the session — one Telegram error per
+            // second, well past the API's flood limit. Back off, cap the attempts,
+            // and post exactly one message when we finally give up.
+            const attempt = (this.setup.attempts || 0) + 1;
+            this.setup.attempts = attempt;
+
+            console.error(`[signal] confirm attempt ${attempt}/${CONFIRM_MAX_ATTEMPTS} failed: ${err.message}`);
+            this.logTrade('SIGNAL_ERROR', { note: `attempt ${attempt}: ${err.message}` });
+
+            if (attempt >= CONFIRM_MAX_ATTEMPTS) {
+                sendTelegram(
+                    `❌ <b>Plan-4</b> ${CONFIG.UNDERLYING}: could not confirm the signal after ` +
+                    `${CONFIRM_MAX_ATTEMPTS} attempts — dropping this setup.\nLast error: ${err.message}`
+                );
+                this.setup = null;
+                return;
+            }
+
+            const backoff = CONFIRM_BACKOFF_MS[attempt - 1] || CONFIRM_BACKOFF_MS[CONFIRM_BACKOFF_MS.length - 1];
+            this.setup.state = 'RETRY';
+            this.setup.retryAtMs = Date.now() + backoff;
+            console.log(`[signal] retrying in ${backoff / 1000}s`);
         }
     }
 

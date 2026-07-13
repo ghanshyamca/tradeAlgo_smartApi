@@ -1,0 +1,9 @@
+# credentials — never commit
+.env
+.session.json
+.session.json.lock
+
+node_modules/
+
+# runtime output
+*.log

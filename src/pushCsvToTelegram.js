@@ -56,6 +56,12 @@ function hhmmToMin(s, def) {
 const PUSH_AT = argOf('--at') || process.env.PUSH_AT || MARKET_CLOSE[MARKET] || '15:30';
 const PUSH_AT_MIN = hhmmToMin(PUSH_AT, 15 * 60 + 30);
 
+// How long after PUSH_AT this job is still allowed to push. The cron starts it a
+// few minutes BEFORE the close, so a launch far past the close means the job was
+// started by hand (or by `pm2 start` when registering the apps) — pushing then
+// would dump a half-day, or an empty, CSV into the channel. Use --now to force.
+const PUSH_WINDOW_MIN = Number(process.env.PUSH_WINDOW_MIN) || 90;
+
 /** Resolve until the IST clock reaches PUSH_AT_MIN. Returns at once if already past. */
 function waitUntilPushTime() {
     return new Promise((resolve) => {
@@ -108,6 +114,16 @@ async function main() {
     if (SEND_NOW) {
         console.log(`[push] ${MARKET}: --now given, skipping the ${PUSH_AT} wait.`);
     } else {
+        // Started long after the close? Then this isn't the daily cron run —
+        // it's a manual/registration start. Do nothing rather than post junk.
+        const late = istMinutesOfDay() - PUSH_AT_MIN;
+        if (late > PUSH_WINDOW_MIN) {
+            console.log(
+                `[push] ${MARKET}: started ${late} min after ${PUSH_AT} IST ` +
+                `(window is ${PUSH_WINDOW_MIN} min) — not pushing. Use --now to force.`
+            );
+            return; // clean exit, nothing sent
+        }
         await waitUntilPushTime();
     }
 
@@ -118,19 +134,23 @@ async function main() {
         { label: 'Signals', file: path.join(DATA_DIR, `plan4_${mkt}_signals_${date}.csv`) },
     ];
 
-    const missing = files.filter((f) => !fs.existsSync(f.file));
-    if (missing.length === files.length) {
-        const msg = `⚠️ <b>${MARKET}</b> ${date} — no CSVs found in data/ to push.`;
+    // A file that exists but is header-only means the engine created it and never
+    // recorded a candle — uploading that just drops an empty attachment in the
+    // channel, so treat "empty" the same as "missing".
+    const present = files.filter((f) => fs.existsSync(f.file) && rowCount(f.file) > 0);
+    const missing = files.filter((f) => !present.includes(f));
+
+    if (!present.length) {
+        const msg = `⚠️ <b>${MARKET}</b> ${date} — no CSV data to push (engine recorded nothing today).`;
         console.error('[push] ' + msg);
         await sendTelegram(msg);
         process.exit(1);
     }
 
-    const present = files.filter((f) => fs.existsSync(f.file));
     await sendTelegram(
         `📊 <b>${MARKET} — end of day ${date}</b>\n` +
         present.map((f) => `• ${f.label}: ${rowCount(f.file)} rows`).join('\n') +
-        (missing.length ? `\n⚠️ missing: ${missing.map((f) => f.label).join(', ')}` : '')
+        (missing.length ? `\n⚠️ missing/empty: ${missing.map((f) => f.label).join(', ')}` : '')
     );
 
     let failed = 0;

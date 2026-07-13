@@ -16,71 +16,40 @@
  * IV, which is why we drop zero-volume strikes before selecting.
  */
 
-const fs = require('fs');
-const path = require('path');
+const scrip = require('./scripMaster');
 
-const MASTER_PATH = path.join(__dirname, '..', '..', 'master.json');
 const RISK_FREE = Number(process.env.RISK_FREE_RATE) || 0.065;
 
 // MCX strikes are stored in paise in the scrip master (16350000 -> 163500).
 const STRIKE_SCALE = 100;
 
-const MONTHS = ['JAN', 'FEB', 'MAR', 'APR', 'MAY', 'JUN', 'JUL', 'AUG', 'SEP', 'OCT', 'NOV', 'DEC'];
+const parseExpiry = scrip.parseExpiry;
 
-/** "25SEP2026" -> Date (expiry ~17:00 IST, i.e. 11:30 UTC). */
-function parseExpiry(s) {
-    const m = /^(\d{2})([A-Z]{3})(\d{4})$/.exec(String(s).trim().toUpperCase());
-    if (!m) return null;
-    const mo = MONTHS.indexOf(m[2]);
-    if (mo === -1) return null;
-    return new Date(Date.UTC(+m[3], mo, +m[1], 11, 30));
-}
+const _chainCache = new Map();
 
-let _chainCache = null; // { GOLD: [rows], SILVER: [rows] } — master.json is 37 MB, parse once
-
-/**
- * All OPTFUT contracts for an underlying, from the scrip master.
- * The 37 MB parse is done once and only the matching rows are retained, so the
- * full master array can be garbage-collected afterwards.
- */
+/** All OPTFUT contracts for an underlying, with strikes and CE/PE decoded. */
 function loadChain(name) {
-    if (!_chainCache) _chainCache = {};
-    if (_chainCache[name]) return _chainCache[name];
+    if (_chainCache.has(name)) return _chainCache.get(name);
 
-    if (!fs.existsSync(MASTER_PATH)) {
-        throw new Error('master.json not found — download the SmartAPI scrip master to the project root');
-    }
-
-    const master = JSON.parse(fs.readFileSync(MASTER_PATH, 'utf8'));
-    const rows = master
-        .filter((r) => r.exch_seg === 'MCX' && r.instrumenttype === 'OPTFUT' && r.name === name)
+    const rows = scrip
+        .contracts('MCX', name, 'OPTFUT')
         .map((r) => ({
-            token: String(r.token),
-            symbol: r.symbol,
-            expiry: r.expiry,
-            expiryDate: parseExpiry(r.expiry),
-            strike: parseFloat(r.strike) / STRIKE_SCALE,
+            ...r,
+            strike: r.strike / STRIKE_SCALE,
             // GOLD25SEP26163500CE -> CE | PE
             optionType: /CE$/.test(r.symbol) ? 'CE' : /PE$/.test(r.symbol) ? 'PE' : null,
-            lotsize: Number(r.lotsize) || 1,
         }))
-        .filter((r) => r.optionType && r.expiryDate && Number.isFinite(r.strike));
+        .filter((r) => r.optionType && Number.isFinite(r.strike));
 
     if (!rows.length) throw new Error(`no MCX OPTFUT contracts for ${name} in master.json`);
 
-    _chainCache[name] = rows;
+    _chainCache.set(name, rows);
     return rows;
 }
 
-/** Nearest expiry not yet past. */
-function nearestExpiry(rows, now = new Date()) {
-    const live = rows
-        .filter((r) => r.expiryDate.getTime() > now.getTime())
-        .sort((a, b) => a.expiryDate - b.expiryDate);
-    if (!live.length) {
-        throw new Error('every MCX expiry in master.json is in the past — refresh master.json');
-    }
-    return live[0].expiry;
+/** Nearest live MCX expiry for this underlying. */
+function nearestExpiry(name) {
+    return scrip.nearestExpiry('MCX', name, 'OPTFUT');
 }
 
 // --- Black-76 ---------------------------------------------------------------
@@ -144,7 +113,7 @@ async function fetchMcxGreeks(smartAPI, name, futLTP, side, opts = {}) {
     if (!(futLTP > 0)) throw new Error(`no futures LTP for ${name} — cannot price the chain`);
 
     const rows = loadChain(name);
-    const expiry = opts.expiry || process.env[`${name}_OPT_EXPIRY`] || nearestExpiry(rows);
+    const expiry = opts.expiry || process.env[`${name}_OPT_EXPIRY`] || nearestExpiry(name);
     const window = Number(opts.window) || Number(process.env.MCX_STRIKE_WINDOW) || 12;
 
     const candidates = rows
