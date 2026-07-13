@@ -66,6 +66,14 @@ const PRESETS = {
         UNDERLYING: 'SILVER', EXPIRY: process.env.SILVER_EXPIRY || '',
         START: '09:00', END: '23:30', USE_GREEKS: false,
     },
+    // MCX gold front-month future (same session as silver, lot size 1).
+    GOLD: {
+        SYMBOL: process.env.GOLD_SYMBOL || 'GOLD05AUG26FUT',
+        TOKEN: process.env.GOLD_TOKEN || '466583',
+        EXCHANGE: 'MCX', WS_EXCHANGE_TYPE: 5,
+        UNDERLYING: 'GOLD', EXPIRY: process.env.GOLD_EXPIRY || '',
+        START: '09:00', END: '23:30', USE_GREEKS: false,
+    },
 };
 
 const P = PRESETS[(process.env.MARKET || 'NIFTY').toUpperCase()] || PRESETS.NIFTY;

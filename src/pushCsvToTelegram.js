@@ -5,13 +5,15 @@
  *   data/plan4_<market>_signals_<YYYY-MM-DD>.csv  — the signal log
  *
  * Usage:
- *   node src/pushCsvToTelegram.js          # waits until 15:30 IST, then uploads
- *   node src/pushCsvToTelegram.js --now    # upload immediately, whatever the time
+ *   node src/pushCsvToTelegram.js                    # NIFTY, waits until 15:30 IST
+ *   node src/pushCsvToTelegram.js --market GOLD      # gold, waits until MCX close 23:30
+ *   node src/pushCsvToTelegram.js --market GOLD --at 15:30
+ *   node src/pushCsvToTelegram.js --now              # upload immediately, whatever the time
  *
- * Env:
- *   MARKET=NIFTY|SILVER   which day's files to send (default NIFTY)
- *   PUSH_AT=15:30         IST time to push at (default 15:30)
- *   CANDLE_MINUTES=30     must match the engine, so the filename matches
+ * Env (CLI flags win):
+ *   MARKET=NIFTY|SILVER|GOLD   which day's files to send (default NIFTY)
+ *   PUSH_AT=15:30              IST time to push at (default = that market's close)
+ *   CANDLE_MINUTES=30          must match the engine, so the filename matches
  *   TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID   (see lib/telegram.js)
  */
 
@@ -21,10 +23,20 @@ require('dotenv').config();
 
 const { sendTelegram, sendTelegramDocument, isConfigured } = require('./lib/telegram');
 
+/** Read `--flag value` from argv. */
+function argOf(flag) {
+    const i = process.argv.indexOf(flag);
+    return i !== -1 ? process.argv[i + 1] : undefined;
+}
+
 const DATA_DIR = path.join(__dirname, '..', 'data');
-const MARKET = (process.env.MARKET || 'NIFTY').toUpperCase();
+const MARKET = (argOf('--market') || process.env.MARKET || 'NIFTY').toUpperCase();
 const CANDLE_MINUTES = Number(process.env.CANDLE_MINUTES) || 30;
 const SEND_NOW = process.argv.includes('--now');
+
+// NIFTY closes 15:30; MCX (gold/silver) runs to 23:30 — default to each market's
+// own close so we never push a half-finished day. Override with --at / PUSH_AT.
+const MARKET_CLOSE = { NIFTY: '15:30', SILVER: '23:30', GOLD: '23:30' };
 
 // --- IST helpers (same convention as plan4Engine: shift UTC by +5:30) --------
 const nowIST = () => new Date(Date.now() + 5.5 * 60 * 60 * 1000);
@@ -40,7 +52,8 @@ function hhmmToMin(s, def) {
     return m ? +m[1] * 60 + +m[2] : def;
 }
 
-const PUSH_AT_MIN = hhmmToMin(process.env.PUSH_AT, 15 * 60 + 30); // 15:30 IST
+const PUSH_AT = argOf('--at') || process.env.PUSH_AT || MARKET_CLOSE[MARKET] || '15:30';
+const PUSH_AT_MIN = hhmmToMin(PUSH_AT, 15 * 60 + 30);
 
 /** Resolve until the IST clock reaches PUSH_AT_MIN. Returns at once if already past. */
 function waitUntilPushTime() {
@@ -50,7 +63,7 @@ function waitUntilPushTime() {
             if (mins >= PUSH_AT_MIN) return resolve();
 
             const left = PUSH_AT_MIN - mins;
-            console.log(`[push] ${left} min until ${process.env.PUSH_AT || '15:30'} IST — waiting…`);
+            console.log(`[push] ${MARKET}: ${left} min until ${PUSH_AT} IST — waiting…`);
             // re-check every minute, so an overnight/long wait stays accurate
             setTimeout(tick, 60 * 1000);
         };
@@ -70,7 +83,7 @@ async function main() {
     }
 
     if (SEND_NOW) {
-        console.log('[push] --now given, skipping the 15:30 wait.');
+        console.log(`[push] ${MARKET}: --now given, skipping the ${PUSH_AT} wait.`);
     } else {
         await waitUntilPushTime();
     }
