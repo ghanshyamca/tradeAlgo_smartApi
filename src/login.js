@@ -16,6 +16,7 @@ const path = require('path');
 require('dotenv').config();
 
 const { generateTotp, secondsUntilRotation } = require('./lib/totp');
+const store = require('./lib/tokenStore');
 
 const ENV_PATH = path.join(__dirname, '..', '.env');
 
@@ -81,19 +82,22 @@ async function login(totp) {
         throw new Error(`Login failed: ${why}`);
     }
 
-    writeEnvTokens({
-        SMARTAPI_ACCESS_TOKEN: data.jwtToken,
-        SMARTAPI_REFRESH_TOKEN: data.refreshToken,
-        SMARTAPI_FEED_TOKEN: data.feedToken,
-    });
-    console.log('[login] ok — tokens written to .env');
-
-    return {
-        smartAPI,
+    const tokens = {
         jwtToken: data.jwtToken,
         refreshToken: data.refreshToken,
         feedToken: data.feedToken,
     };
+
+    writeEnvTokens({
+        SMARTAPI_ACCESS_TOKEN: tokens.jwtToken,
+        SMARTAPI_REFRESH_TOKEN: tokens.refreshToken,
+        SMARTAPI_FEED_TOKEN: tokens.feedToken,
+    });
+    // Share it: the engines read .session.json and skip their own login.
+    store.save(tokens);
+    console.log('[login] ok — tokens written to .env and .session.json');
+
+    return { smartAPI, ...tokens };
 }
 
 if (require.main === module) {
