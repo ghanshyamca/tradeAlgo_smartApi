@@ -41,6 +41,7 @@ const { WebSocketV2 } = require('smartapi-javascript');
 const { createSession } = require('./lib/session');
 const { bollingerBands, bandPosition, isReversalCandle } = require('./lib/indicators');
 const { fetchOptionGreeks, selectStrike } = require('./lib/greeks');
+const { fetchMcxGreeks } = require('./lib/mcxGreeks');
 const { sendTelegram } = require('./lib/telegram');
 
 // ----------------------------------------------------------------------------
@@ -64,7 +65,7 @@ const PRESETS = {
         TOKEN: process.env.SILVER_TOKEN || '471725',
         EXCHANGE: 'MCX', WS_EXCHANGE_TYPE: 5,
         UNDERLYING: 'SILVER', EXPIRY: process.env.SILVER_EXPIRY || '',
-        START: '09:00', END: '23:30', USE_GREEKS: false,
+        START: '09:00', END: '23:30', USE_GREEKS: false, MCX_OPTIONS: true,
     },
     // MCX gold front-month future (same session as silver, lot size 1).
     GOLD: {
@@ -72,7 +73,7 @@ const PRESETS = {
         TOKEN: process.env.GOLD_TOKEN || '466583',
         EXCHANGE: 'MCX', WS_EXCHANGE_TYPE: 5,
         UNDERLYING: 'GOLD', EXPIRY: process.env.GOLD_EXPIRY || '',
-        START: '09:00', END: '23:30', USE_GREEKS: false,
+        START: '09:00', END: '23:30', USE_GREEKS: false, MCX_OPTIONS: true,
     },
 };
 
@@ -89,7 +90,8 @@ const CONFIG = {
     WS_EXCHANGE_TYPE: P.WS_EXCHANGE_TYPE,
     UNDERLYING: P.UNDERLYING,                    // for optionGreek
     EXPIRY: P.EXPIRY,
-    USE_GREEKS: P.USE_GREEKS,
+    USE_GREEKS: P.USE_GREEKS,            // NSE optionGreek endpoint (NIFTY)
+    MCX_OPTIONS: Boolean(P.MCX_OPTIONS), // MCX chain priced locally (GOLD/SILVER)
 
     BB_PERIOD: 20,
     BB_MULT: 2,
@@ -484,13 +486,24 @@ class Plan4Engine {
     async confirmSignal() {
         this.setup.state = 'CONFIRMING';
         try {
-            let pick = null;
+            // Same d3 rule for both markets; only the chain source differs.
+            //   NSE  -> Angel's optionGreek endpoint (exchange-published greeks)
+            //   MCX  -> chain from master.json, priced locally with Black-76
+            let greeks = null;
             if (CONFIG.USE_GREEKS) {
-                const greeks = await fetchOptionGreeks(this.smartAPI, CONFIG.UNDERLYING, CONFIG.EXPIRY);
+                greeks = await fetchOptionGreeks(this.smartAPI, CONFIG.UNDERLYING, CONFIG.EXPIRY);
+            } else if (CONFIG.MCX_OPTIONS) {
+                greeks = await fetchMcxGreeks(this.smartAPI, CONFIG.UNDERLYING, this.lastLTP, this.setup.side);
+            }
+
+            let pick = null;
+            if (greeks) {
                 pick = selectStrike(greeks, this.setup.side, CONFIG.DELTA_THRESHOLD);
                 if (!pick) {
-                    this.logTrade('NO_SIGNAL', { side: this.setup.side, note: 'no strike with delta>=0.5' });
-                    console.log(`[signal] no ${this.setup.side} strike with |delta|>=${CONFIG.DELTA_THRESHOLD}; nothing posted`);
+                    const note = `no ${this.setup.side} strike with |delta|>=${CONFIG.DELTA_THRESHOLD}`;
+                    this.logTrade('NO_SIGNAL', { side: this.setup.side, note });
+                    console.log(`[signal] ${note}; nothing posted`);
+                    sendTelegram(`ℹ️ <b>Plan-4</b> ${CONFIG.UNDERLYING}: setup confirmed but ${note} — no strike posted.`);
                     this.setup = null;
                     return;
                 }
@@ -499,7 +512,8 @@ class Plan4Engine {
             this.setup.pick = pick;
 
             const strikeLine = pick
-                ? `Strike: <b>${pick.strikePrice} ${this.setup.side}</b>  (delta ${pick.delta.toFixed(3)}, IV ${pick.impliedVolatility}%)\n`
+                ? `Strike: <b>${pick.strikePrice} ${this.setup.side}</b>  (delta ${pick.delta.toFixed(3)}, IV ${pick.impliedVolatility}%)\n` +
+                  (pick.symbol ? `Contract: <b>${pick.symbol}</b>  (LTP ${pick.ltp}, exp ${pick.expiry})\n` : '')
                 : `Instrument: <b>${CONFIG.SYMBOL}</b>  (side ${this.setup.side}, futures — no greeks)\n`;
 
             const msg =
